@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 from bs4 import BeautifulSoup
+sys.path.append(os.path.abspath('..'))
 from vpnlogin import NuistVPNClient
 
 # --- 全局配置 ---
@@ -125,6 +126,72 @@ class LoginState:
 login_state = LoginState()
 
 
+def _is_auth_failure(code, msg=""):
+    """判断响应是否表示鉴权/登录态失效。
+
+    仅 401 直接认定；403 结合文案（避免限频 403 误重登）。
+    其它业务 code 不再靠宽泛关键词猜鉴权。
+    """
+    msg = str(msg or "")
+    if code == 401:
+        return True
+    if code == 403:
+        keywords = ("登录", "token", "Token", "授权", "认证", "未登录", "过期", "失效", "重新登录")
+        return any(k in msg for k in keywords)
+    return False
+
+
+def _get_live_token(fallback=None):
+    """优先使用 login_state 中最新 token，避免主循环用过期快照"""
+    return login_state.token or fallback
+
+
+def _is_full_msg(msg):
+    """判断消息是否表示课程已满（避免过宽匹配「满」字）
+
+    不使用裸「已满」，以免误伤「已满足先修条件」等文案。
+    """
+    msg = str(msg or "")
+    keywords = ("课容量已满", "人数已满", "容量已满", "名额已满", "选课人数已满", "课容量已达上限")
+    return any(k in msg for k in keywords)
+
+
+def _is_already_selected_msg(msg):
+    """判断消息是否表示目标课已选/重复选"""
+    msg = str(msg or "")
+    keywords = (
+        "已选该", "已经选过", "已经选择", "已选择该", "您已选", "你已选",
+        "重复选", "不可重复", "不能重复", "请勿重复", "重复提交",
+        "已在选课结果", "已选中该",
+    )
+    return any(k in msg for k in keywords)
+
+
+def _extract_ws_clazz_id(data):
+    """从 WebSocket 失败/成功 data 中尽量取出教学班 ID"""
+    if not isinstance(data, dict):
+        return ""
+    cid = data.get("clazzId") or data.get("teachingClassID") or data.get("JXBID") or ""
+    if not cid:
+        for course in data.get("xkjgList") or []:
+            if not isinstance(course, dict):
+                continue
+            cid = course.get("teachingClassID") or course.get("JXBID") or ""
+            if cid:
+                break
+    return str(cid) if cid else ""
+
+
+def _extract_student_id(login_data):
+    """从 login_data.student 提取学号（skip-login 等场景）"""
+    student = (login_data or {}).get("student") or {}
+    for key in ("XH", "xh", "studentId", "studentID", "loginName", "username", "USERID"):
+        val = student.get(key)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    return None
+
+
 def relogin_vpn():
     """重新登录VPN"""
     if login_state.use_vpn and login_state.vpn_client:
@@ -145,6 +212,10 @@ def relogin_vpn():
 
 def relogin_system():
     """重新登录选课系统"""
+    if not login_state.username or not login_state.password:
+        print("\n[✗] 无学号/密码，无法重新登录（--skip-login 时需同时提供 -u/-p 才能自动重登）")
+        main_logger.error("无账密，跳过选课系统重登")
+        return False
     print("\n[!] 正在重新登录选课系统...")
     main_logger.info("正在重新登录选课系统")
     try:
@@ -161,72 +232,109 @@ def relogin_system():
         return False
 
 
+_RELOGIN_LOCK = threading.Lock()
+_RELOGIN_DEBOUNCE_SECONDS = 5.0
+_relogin_last_finished_at = 0.0
+_relogin_last_success = False
+
+
+def _finish_relogin(success):
+    """记录本次重登结果，供并发调用在防抖窗口内复用。"""
+    global _relogin_last_finished_at, _relogin_last_success
+    _relogin_last_finished_at = time.monotonic()
+    _relogin_last_success = bool(success and login_state.token)
+    return _relogin_last_success, login_state.token if _relogin_last_success else None
+
+
 def handle_relogin(response=None):
-    """
-    处理重新登录逻辑
-    - 如果有302跳转，重登VPN+选课系统
-    - 没有302则直接重登选课系统，验证码获取失败时再重登VPN
-    返回: (success, new_token)
-    """
-    # 检查是否有302跳转（通过response.history或状态码判断）
-    has_redirect = False
-    if response is not None:
-        # requests 默认会自动跟随重定向，可以通过 history 检查
-        if response.history:
-            for hist in response.history:
-                if hist.status_code in [301, 302, 303, 307, 308]:
-                    has_redirect = True
-                    print(f"[!] 检测到重定向: {hist.status_code} -> {hist.headers.get('Location', '')}")
-                    main_logger.info(f"检测到重定向: {hist.status_code}")
-                    break
-        # 也检查最终URL是否包含登录页面特征
-        if 'login' in response.url.lower() or 'auth' in response.url.lower():
-            has_redirect = True
-            print(f"[!] 检测到跳转到登录页: {response.url}")
-    
-    if has_redirect:
-        # 有302跳转，重登VPN+选课系统
-        print("[!] 检测到302跳转，需要重新登录VPN和选课系统")
-        if not relogin_vpn():
+    """串行化重登，并在短时间内复用最近一次的结果。"""
+    global _relogin_last_finished_at, _relogin_last_success
+
+    # HTTP 心跳与前台请求共用 session；只允许一个线程执行实际重登。
+    with _RELOGIN_LOCK:
+        now = time.monotonic()
+        elapsed = now - _relogin_last_finished_at
+        if _relogin_last_finished_at and elapsed < _RELOGIN_DEBOUNCE_SECONDS:
+            if _relogin_last_success and login_state.token:
+                main_logger.info(
+                    f"重登防抖：复用 {elapsed:.1f}s 前的成功登录结果"
+                )
+                return True, login_state.token
+            main_logger.warning(
+                f"重登防抖：距上次失败仅 {elapsed:.1f}s，跳过重复登录"
+            )
             return False, None
-        if not relogin_system():
-            return False, None
-    else:
-        # 没有302，直接尝试重登选课系统
-        print("[!] 尝试重新登录选课系统...")
-        try:
-            if not relogin_system():
-                # 验证码获取失败等情况，尝试重登VPN
-                print("[!] 选课系统登录失败，尝试重新登录VPN...")
-                if not relogin_vpn():
-                    return False, None
-                if not relogin_system():
-                    return False, None
-        except Exception as e:
-            # 捕获验证码获取失败等异常
-            print(f"[!] 登录异常: {e}，尝试重新登录VPN...")
-            main_logger.error(f"登录异常: {e}")
+
+        # 检查是否有302跳转（通过response.history或状态码判断）
+        has_redirect = False
+        if response is not None:
+            # requests 默认会自动跟随重定向，可以通过 history 检查
+            if response.history:
+                for hist in response.history:
+                    if hist.status_code in [301, 302, 303, 307, 308]:
+                        has_redirect = True
+                        print(f"[!] 检测到重定向: {hist.status_code} -> {hist.headers.get('Location', '')}")
+                        main_logger.info(f"检测到重定向: {hist.status_code}")
+                        break
+            # 也检查最终URL是否包含登录页面特征
+            if 'login' in response.url.lower() or 'auth' in response.url.lower():
+                has_redirect = True
+                print(f"[!] 检测到跳转到登录页: {response.url}")
+
+        if has_redirect:
+            # 有302跳转，重登VPN+选课系统
+            print("[!] 检测到302跳转，需要重新登录VPN和选课系统")
             if not relogin_vpn():
-                return False, None
+                return _finish_relogin(False)
             if not relogin_system():
-                return False, None
-    
-    return True, login_state.token
+                return _finish_relogin(False)
+        else:
+            # 没有302，直接尝试重登选课系统
+            print("[!] 尝试重新登录选课系统...")
+            try:
+                if not relogin_system():
+                    # 验证码获取失败等情况，尝试重登VPN
+                    print("[!] 选课系统登录失败，尝试重新登录VPN...")
+                    if not relogin_vpn():
+                        return _finish_relogin(False)
+                    if not relogin_system():
+                        return _finish_relogin(False)
+            except Exception as e:
+                # 捕获验证码获取失败等异常
+                print(f"[!] 登录异常: {e}，尝试重新登录VPN...")
+                main_logger.error(f"登录异常: {e}")
+                if not relogin_vpn():
+                    return _finish_relogin(False)
+                if not relogin_system():
+                    return _finish_relogin(False)
+
+        return _finish_relogin(True)
 
 
 # HTTP 心跳管理类（用于维持登录态）
 class HttpHeartbeat:
     """HTTP 心跳管理，每隔30秒请求课程列表保持登录态"""
-    
-    def __init__(self, session, token, batch_id, campus, interval=30):
+
+    def __init__(self, session, token, batch_id, campus, interval=30, on_relogin=None):
         self.session = session
         self.token = token
         self.batch_id = batch_id
         self.campus = campus
         self.interval = interval
+        self.on_relogin = on_relogin  # 重登成功后回调，用于同步 WS cookie 等
         self.running = False
         self.thread = None
-    
+
+    def _notify_relogin(self, new_token):
+        """重登成功后更新 token 并触发 on_relogin（如同步 WS cookies）"""
+        self.token = new_token
+        login_state.token = new_token
+        if self.on_relogin:
+            try:
+                self.on_relogin(new_token)
+            except Exception as e:
+                heartbeat_logger.warning(f"[HTTP心跳] on_relogin 回调异常: {e}")
+
     def _heartbeat_loop(self):
         """心跳循环，每interval秒请求一次课程列表"""
         while self.running:
@@ -234,7 +342,7 @@ class HttpHeartbeat:
                 time.sleep(self.interval)
                 if not self.running:
                     break
-                
+
                 headers = {
                     **COMMON_HEADERS,
                     "Authorization": self.token,
@@ -249,40 +357,51 @@ class HttpHeartbeat:
                     "campus": self.campus,
                     "SFYX": "2"
                 }
-                
+
                 response = self.session.post(URL_LIST_CLASSES, headers=headers, data=json.dumps(body), timeout=10)
-                
+
                 try:
                     data = response.json()
                     code = data.get("code")
+                    msg = str(data.get("msg", ""))
                     if code == 200:
                         heartbeat_logger.debug("[HTTP心跳] 成功")
+                    elif _is_auth_failure(code, msg):
+                        print(f"\n[HTTP心跳] 鉴权失败(code={code})，触发重登...")
+                        heartbeat_logger.warning(f"[HTTP心跳] 鉴权失败: code={code}, msg={msg}")
+                        success, new_token = handle_relogin(response)
+                        if success and new_token:
+                            self._notify_relogin(new_token)
+                            print("[HTTP心跳] 重新登录成功")
+                            heartbeat_logger.info("[HTTP心跳] 重新登录成功")
+                        else:
+                            print("[HTTP心跳] 重新登录失败")
+                            heartbeat_logger.error("[HTTP心跳] 重新登录失败")
                     else:
-                        heartbeat_logger.warning(f"[HTTP心跳] 响应code={code}, msg={data.get('msg')}")
+                        heartbeat_logger.warning(f"[HTTP心跳] 响应code={code}, msg={msg}")
                 except json.JSONDecodeError as e:
                     print(f"\n[HTTP心跳] JSON解析失败，触发重登流程: {e}")
                     heartbeat_logger.warning(f"[HTTP心跳] JSON解析失败: {e}, 响应: {response.text[:200]}")
-                    
+
                     # 立即执行重登流程
                     success, new_token = handle_relogin(response)
                     if success and new_token:
-                        self.token = new_token
-                        login_state.token = new_token
+                        self._notify_relogin(new_token)
                         print("[HTTP心跳] 重新登录成功")
                         heartbeat_logger.info("[HTTP心跳] 重新登录成功")
                     else:
                         print("[HTTP心跳] 重新登录失败")
                         heartbeat_logger.error("[HTTP心跳] 重新登录失败")
-                        
+
             except requests.exceptions.RequestException as e:
                 heartbeat_logger.warning(f"[HTTP心跳] 请求异常: {e}")
             except Exception as e:
                 heartbeat_logger.error(f"[HTTP心跳] 异常: {e}")
-    
+
     def update_token(self, new_token):
         """更新token（重登后调用）"""
         self.token = new_token
-    
+
     def start(self):
         """启动HTTP心跳（在后台线程运行）"""
         if self.running:
@@ -291,7 +410,7 @@ class HttpHeartbeat:
         self.thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self.thread.start()
         heartbeat_logger.info(f"[HTTP心跳] 已启动，间隔 {self.interval} 秒")
-    
+
     def stop(self):
         """停止HTTP心跳"""
         self.running = False
@@ -300,9 +419,9 @@ class HttpHeartbeat:
 
 # WebSocket 心跳管理类
 class WebSocketHeartbeat:
-    """WebSocket 心跳管理，每隔5秒发送 'hi' 保持连接"""
-    
-    def __init__(self, student_id, cookies=None, use_vpn=False):
+    """WebSocket 心跳管理，每隔5秒发送 'hi' 保持连接，并监听选课成功/失败消息"""
+
+    def __init__(self, student_id, cookies=None, use_vpn=False, on_course_success=None, on_course_fail=None):
         self.student_id = student_id
         self.cookies = cookies
         self.use_vpn = use_vpn
@@ -310,28 +429,80 @@ class WebSocketHeartbeat:
         self.running = False
         self.thread = None
         self.heartbeat_thread = None
-        
+        self.on_course_success = on_course_success
+        self.on_course_fail = on_course_fail
+        self.success_messages = []
+        self._lock = threading.Lock()
+
         # 根据是否使用VPN选择不同的WebSocket地址
         if use_vpn:
             # VPN 模式下的 WebSocket 地址
             self.ws_url = f"wss://client.vpn.nuist.edu.cn/https/webvpn3315a96df5a2811a49489fcebfe8b135dece10c6255d04cc36c652f60ee89b3a/xsxk/websocket/{student_id}"
         else:
             self.ws_url = f"wss://xsxk.nuist.edu.cn/xsxk/websocket/{student_id}"
-    
+
     def _on_open(self, ws):
         heartbeat_logger.info(f"[WebSocket] 连接已建立: {self.student_id}")
         # 启动心跳线程
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
-    
+
     def _on_message(self, ws, message):
-        # heartbeat_logger.debug(f"[WebSocket] 收到消息: {message}")
         try:
             data = json.loads(message)
-            heartbeat_logger.info(f"[WebSocket] 解析消息: {data}")
             code = data.get("code")
+            msg = data.get("msg", "")
+            result_data = data.get("data")
+
+            # 心跳包
+            if code == 200 and result_data == "heart":
+                heartbeat_logger.debug(f"[WebSocket] 心跳包响应: {data}")
+                return
+
+            heartbeat_logger.info(f"[WebSocket] 解析消息: {data}")
+
+            # 选课成功
+            if code == 200 and "选课成功" in str(msg):
+                clazz_id = ""
+                course_name = ""
+                if isinstance(result_data, dict):
+                    clazz_id = result_data.get("clazzId", "")
+                    for course in result_data.get("xkjgList", []):
+                        if course.get("teachingClassID") == clazz_id:
+                            course_name = course.get("KCM", "")
+                            break
+                if not course_name:
+                    course_name = msg.split(":", 1)[1] if ":" in str(msg) else str(msg)
+
+                print(f"\n[WebSocket] 🎉 选课成功: {course_name}")
+                main_logger.info(f"[WebSocket] 选课成功: {course_name}, clazzId={clazz_id}")
+                with self._lock:
+                    self.success_messages.append({
+                        "clazz_id": clazz_id,
+                        "course_name": course_name,
+                        "msg": msg,
+                        "data": result_data,
+                        "timestamp": time.time()
+                    })
+                if self.on_course_success:
+                    try:
+                        self.on_course_success(clazz_id, course_name, msg, result_data)
+                    except Exception as e:
+                        heartbeat_logger.error(f"[WebSocket] 选课成功回调异常: {e}")
+                return
+
+            # 选课失败（课容量已满等）
+            if code == 500:
+                print(f"\n[WebSocket] ⚠️ 选课失败: {msg}")
+                main_logger.warning(f"[WebSocket] 选课失败: {msg}")
+                if self.on_course_fail:
+                    try:
+                        self.on_course_fail(code, msg, result_data)
+                    except Exception as e:
+                        heartbeat_logger.error(f"[WebSocket] 选课失败回调异常: {e}")
+                return
+
             if code is not None and code != 200:
-                msg = data.get("msg", "未知错误")
                 print(f"\n[WebSocket 警告] code={code}, msg={msg}")
                 heartbeat_logger.warning(f"[WebSocket] 非200响应: code={code}, msg={msg}")
         except json.JSONDecodeError:
@@ -339,10 +510,10 @@ class WebSocketHeartbeat:
             pass
         except Exception as e:
             heartbeat_logger.error(f"[WebSocket] 解析消息异常: {e}")
-    
+
     def _on_error(self, ws, error):
         heartbeat_logger.error(f"[WebSocket] 错误: {error}")
-    
+
     def _on_close(self, ws, close_status_code, close_msg):
         heartbeat_logger.info(f"[WebSocket] 连接已关闭: {close_status_code} - {close_msg}")
         # 如果还在运行状态，尝试重连
@@ -350,19 +521,28 @@ class WebSocketHeartbeat:
             heartbeat_logger.info("[WebSocket] 尝试重新连接...")
             time.sleep(2)
             self._connect()
-    
+
     def _heartbeat_loop(self):
         """心跳循环，每5秒发送一次 'hi'"""
+        consecutive_failures = 0
+        max_failures = 3
         while self.running and self.ws:
             try:
                 if self.ws.sock and self.ws.sock.connected:
                     self.ws.send("hi")
                     heartbeat_logger.debug("[WebSocket] 发送心跳: hi")
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    heartbeat_logger.warning(f"[WebSocket] 连接异常 ({consecutive_failures}/{max_failures})")
                 time.sleep(5)
             except Exception as e:
-                heartbeat_logger.error(f"[WebSocket] 心跳发送失败: {e}")
-                break
-    
+                consecutive_failures += 1
+                heartbeat_logger.error(f"[WebSocket] 心跳发送失败 ({consecutive_failures}/{max_failures}): {e}")
+                if consecutive_failures >= max_failures:
+                    break
+                time.sleep(2)
+
     def _connect(self):
         """建立 WebSocket 连接"""
         try:
@@ -370,7 +550,7 @@ class WebSocketHeartbeat:
             cookie_str = ""
             if self.cookies:
                 cookie_str = "; ".join([f"{k}={v}" for k, v in self.cookies.items()])
-            
+
             self.ws = websocket.WebSocketApp(
                 self.ws_url,
                 on_open=self._on_open,
@@ -382,7 +562,7 @@ class WebSocketHeartbeat:
             self.ws.run_forever()
         except Exception as e:
             heartbeat_logger.error(f"[WebSocket] 连接失败: {e}")
-    
+
     def start(self):
         """启动 WebSocket 心跳（在后台线程运行）"""
         if self.running:
@@ -391,13 +571,43 @@ class WebSocketHeartbeat:
         self.thread = threading.Thread(target=self._connect, daemon=True)
         self.thread.start()
         heartbeat_logger.info(f"[WebSocket] 心跳线程已启动")
-    
+
     def stop(self):
         """停止 WebSocket 心跳"""
         self.running = False
         if self.ws:
             self.ws.close()
         heartbeat_logger.info("[WebSocket] 心跳已停止")
+
+    def update_cookies(self, cookies):
+        """重登后更新 cookie，并触发重连"""
+        self.cookies = cookies or {}
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+    def set_success_callback(self, callback):
+        self.on_course_success = callback
+
+    def set_fail_callback(self, callback):
+        self.on_course_fail = callback
+
+    def check_success(self, clazz_id=None):
+        """查询成功消息。传入 clazz_id 时只匹配非空且相等的 id（str 比较）。"""
+        with self._lock:
+            if clazz_id is not None:
+                cid = str(clazz_id)
+                return [
+                    m for m in self.success_messages
+                    if m.get("clazz_id") and str(m["clazz_id"]) == cid
+                ]
+            return list(self.success_messages)
+
+    def clear_success_messages(self):
+        with self._lock:
+            self.success_messages.clear()
 
 
 # --- 辅助函数 ---
@@ -977,45 +1187,80 @@ def _choose_teaching_class(all_classes, course_type, has_multi_courses=False, is
 
 def drop_class(session, token, batch_id, course_to_drop, course_type=COURSE_TYPE_FANKC):
     """退掉指定课程
-    
+
+    鉴权失败或 JSON 解析失败时尝试重登并用新 token 再试一次。
+
     Args:
         session: requests.Session 对象
         token: 认证token
         batch_id: 选课批次ID
         course_to_drop: 要退的课程信息（含 secretVal）
         course_type: 课程类型
-        
+
     Returns:
         bool: 是否退课成功
     """
-    headers = {
-        **COMMON_HEADERS,
-        "Authorization": token,
-        "batchId": batch_id,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
-    body = {
-        "clazzType": course_type,
-        "clazzId": course_to_drop['JXBID'],
-        "secretVal": course_to_drop['secretVal']
-    }
-    
-    try:
-        response = session.post(URL_DEL_CLASS, headers=headers, data=urlencode(body, quote_via=quote_plus), timeout=10)
-        result = response.json()
-        
+    def _do_drop(tk):
+        headers = {
+            **COMMON_HEADERS,
+            "Authorization": tk,
+            "batchId": batch_id,
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        body = {
+            "clazzType": course_type,
+            "clazzId": course_to_drop['JXBID'],
+            "secretVal": course_to_drop['secretVal']
+        }
+        response = session.post(
+            URL_DEL_CLASS, headers=headers,
+            data=urlencode(body, quote_via=quote_plus), timeout=10
+        )
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            return "auth_or_parse", response, None
         code = result.get('code')
         msg = result.get('msg', '无消息')
-        
         if code == 200:
+            return "ok", response, result
+        if _is_auth_failure(code, msg):
+            return "auth", response, result
+        return "fail", response, result
+
+    try:
+        status, response, result = _do_drop(token)
+        if status == "ok":
+            msg = (result or {}).get('msg', '无消息')
             print(f"[✓] 退课成功: {msg}")
             main_logger.info(f"退课成功: {course_to_drop.get('KCM', '未知')} - {msg}")
             return True
-        else:
-            print(f"[✗] 退课失败: {code} - {msg}")
-            main_logger.warning(f"退课失败: {code} - {msg}")
+
+        if status in ("auth", "auth_or_parse"):
+            print("[!] 退课鉴权/解析失败，尝试重登后重试...")
+            main_logger.warning(f"退课鉴权失败，尝试重登: status={status}")
+            success, new_token = handle_relogin(response)
+            if success and new_token:
+                login_state.token = new_token
+                status2, _, result2 = _do_drop(new_token)
+                if status2 == "ok":
+                    msg = (result2 or {}).get('msg', '无消息')
+                    print(f"[✓] 退课成功(重登后): {msg}")
+                    main_logger.info(f"退课成功(重登后): {course_to_drop.get('KCM', '未知')} - {msg}")
+                    return True
+                msg2 = (result2 or {}).get('msg', '无消息') if result2 else '解析失败'
+                print(f"[✗] 退课失败(重登后仍失败): {msg2}")
+                main_logger.warning(f"退课失败(重登后): {msg2}")
+                return False
+            print("[✗] 退课重登失败")
+            main_logger.error("退课重登失败")
             return False
+
+        code = (result or {}).get('code')
+        msg = (result or {}).get('msg', '无消息')
+        print(f"[✗] 退课失败: {code} - {msg}")
+        main_logger.warning(f"退课失败: {code} - {msg}")
+        return False
     except Exception as e:
         print(f"[✗] 退课请求异常: {e}")
         main_logger.error(f"退课请求异常: {e}")
@@ -1024,7 +1269,7 @@ def drop_class(session, token, batch_id, course_to_drop, course_type=COURSE_TYPE
 
 def get_course_capacity(session, token, batch_id, campus, target_class_id, course_type=COURSE_TYPE_FANKC):
     """查询指定课程的当前容量信息
-    
+
     Args:
         session: requests.Session 对象
         token: 认证token
@@ -1032,7 +1277,7 @@ def get_course_capacity(session, token, batch_id, campus, target_class_id, cours
         campus: 校区
         target_class_id: 目标课程的 JXBID
         course_type: 课程类型
-        
+
     Returns:
         tuple: (已选人数, 课容量, 课程对象) 或 (None, None, None)
     """
@@ -1042,7 +1287,7 @@ def get_course_capacity(session, token, batch_id, campus, target_class_id, cours
         "Batchid": batch_id,
         "Content-Type": "application/json;charset=UTF-8"
     }
-    
+
     body = {
         "teachingClassType": course_type,
         "pageNumber": 1,
@@ -1051,316 +1296,663 @@ def get_course_capacity(session, token, batch_id, campus, target_class_id, cours
         "campus": campus,
         "SFYX": "2"
     }
-    
+
     try:
         response = session.post(URL_LIST_CLASSES, headers=headers, data=json.dumps(body), timeout=10)
         data = response.json()
-        
+
         if data.get("code") != 200:
             return None, None, None
-        
+
+        target_str = str(target_class_id)
         courses = data.get("data", {}).get("rows", [])
         for course in courses:
             for clazz in course.get("tcList", []):
-                if clazz['JXBID'] == target_class_id:
+                if str(clazz.get('JXBID', '')) == target_str:
                     return int(clazz['YXRS']), int(clazz['KRL']), clazz
-        
+
         return None, None, None
     except Exception as e:
         print(f"[!] 查询课容量异常: {e}")
         return None, None, None
 
 
-def start_monitoring(session, token, batch_id, campus, target_class, drop_class_info, course_type=COURSE_TYPE_FANKC):
-    """监控目标课程容量，检测到有空位时先退课再选课
-    
-    Args:
-        session: requests.Session 对象
-        token: 认证token
-        batch_id: 选课批次ID
-        campus: 校区
-        target_class: 目标课程信息
-        drop_class_info: 要退的课程信息（含 secretVal）
-        course_type: 课程类型
+def fetch_selected_classes(session, token, batch_id, campus, course_type=COURSE_TYPE_FANKC,
+                           exclude_jxbid=None, page_size=200):
+    """拉取当前轮次下已选教学班（SFYX==1），不依赖目标课列表页。
+
+    通过 list 接口按 SFYX=1 过滤；若服务端忽略该过滤，再本地二次筛。
+    可排除目标课自身。
+
+    Returns:
+        list: 已选教学班字典列表；失败返回 []
+    """
+    headers = {
+        **COMMON_HEADERS,
+        "Authorization": token,
+        "Batchid": batch_id,
+        "Content-Type": "application/json;charset=UTF-8"
+    }
+    body = {
+        "teachingClassType": course_type,
+        "pageNumber": 1,
+        "pageSize": page_size,
+        "orderBy": "",
+        "campus": campus,
+        "SFYX": "1",  # 优先只要已选
+    }
+    try:
+        response = session.post(URL_LIST_CLASSES, headers=headers, data=json.dumps(body), timeout=15)
+        data = response.json()
+        if data.get("code") != 200:
+            print(f"[!] 拉取已选课失败: {data.get('msg')}")
+            main_logger.warning(f"拉取已选课失败: {data}")
+            return []
+
+        selected = []
+        seen = set()
+        courses = data.get("data", {}).get("rows", []) or []
+        for course in courses:
+            parent_name = course.get("KCM", "")
+            for clazz in course.get("tcList", []) or []:
+                jxbid = clazz.get("JXBID")
+                if not jxbid or jxbid in seen:
+                    continue
+                # 服务端若忽略 SFYX=1，本地再筛
+                if str(clazz.get("SFYX", "0")) != "1":
+                    continue
+                if exclude_jxbid and jxbid == exclude_jxbid:
+                    continue
+                # 便于展示：挂上父课程名
+                if not clazz.get("KCM") and parent_name:
+                    clazz = dict(clazz)
+                    clazz["KCM"] = parent_name
+                    clazz["_parent_course"] = parent_name
+                selected.append(clazz)
+                seen.add(jxbid)
+
+        # 若 SFYX=1 请求结果为空，回退拉全量再筛（兼容服务端忽略过滤）
+        if not selected:
+            body_all = dict(body)
+            body_all["SFYX"] = "2"
+            response2 = session.post(
+                URL_LIST_CLASSES, headers=headers, data=json.dumps(body_all), timeout=15
+            )
+            data2 = response2.json()
+            if data2.get("code") == 200:
+                for course in data2.get("data", {}).get("rows", []) or []:
+                    parent_name = course.get("KCM", "")
+                    for clazz in course.get("tcList", []) or []:
+                        jxbid = clazz.get("JXBID")
+                        if not jxbid or jxbid in seen:
+                            continue
+                        if str(clazz.get("SFYX", "0")) != "1":
+                            continue
+                        if exclude_jxbid and jxbid == exclude_jxbid:
+                            continue
+                        if not clazz.get("KCM") and parent_name:
+                            clazz = dict(clazz)
+                            clazz["KCM"] = parent_name
+                            clazz["_parent_course"] = parent_name
+                        selected.append(clazz)
+                        seen.add(jxbid)
+
+        main_logger.info(f"已选课拉取完成: {len(selected)} 门")
+        return selected
+    except Exception as e:
+        print(f"[!] 拉取已选课异常: {e}")
+        main_logger.error(f"拉取已选课异常: {e}")
+        return []
+
+
+def _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+    """列表复核：目标教学班是否已选上。
+
+    优先 get_course_capacity 看 SFYX==1；再 fetch_selected_classes 看是否在已选列表。
+    JXBID 一律 str 比较。
+    """
+    live_token = _get_live_token(token)
+    campus = login_state.campus
+    tid = str(target_id)
+    try:
+        _, _, latest = get_course_capacity(
+            session, live_token, batch_id, campus, target_id, course_type
+        )
+        if latest and str(latest.get("SFYX", "0")) == "1":
+            main_logger.info(f"列表复核成功(SFYX=1): {tid}")
+            return True
+    except Exception as e:
+        main_logger.warning(f"列表复核 get_course_capacity 异常: {e}")
+
+    try:
+        selected = fetch_selected_classes(
+            session, live_token, batch_id, campus, course_type
+        )
+        for clazz in selected or []:
+            if str(clazz.get("JXBID", "")) == tid:
+                main_logger.info(f"列表复核成功(已选列表): {tid}")
+                return True
+    except Exception as e:
+        main_logger.warning(f"列表复核 fetch_selected_classes 异常: {e}")
+
+    return False
+
+
+def _try_add_class(session, token, batch_id, select_class, course_type, ws_heartbeat=None, wait_timeout=5.0):
+    """提交选课并尽量用 WebSocket / 列表复核确认真实成功。
+
+    Returns:
+        tuple: (ok: bool, reason: str)
+            ok=True 表示确认选上；False 表示失败/未确认
+            reason: success / http_fail / timeout / exception / full / relogin / other_fail
+    """
+    secret = select_class.get('secretVal')
+    if not secret:
+        print("[✗] 缺少 secretVal，无法提交选课")
+        main_logger.error("选课缺少 secretVal")
+        return False, "exception"
+
+    headers = {
+        **COMMON_HEADERS,
+        "Authorization": token,
+        "batchId": batch_id,
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    body = {
+        "clazzType": course_type,
+        "clazzId": select_class['JXBID'],
+        "secretVal": secret
+    }
+
+    ws_success_event = threading.Event()
+    ws_fail_event = threading.Event()
+    ws_fail_reason = {"value": "other_fail"}
+    target_id = select_class['JXBID']
+    target_id_str = str(target_id)
+
+    def on_success(clazz_id, course_name, msg, data):
+        # 仅 clazz_id 非空且与目标匹配才认定成功；空 id 忽略
+        if clazz_id and str(clazz_id) == target_id_str:
+            ws_success_event.set()
+
+    def on_fail(code, msg, data):
+        fail_id = _extract_ws_clazz_id(data)
+        # 带 id 且不是目标课 → 忽略
+        if fail_id and str(fail_id) != target_id_str:
+            main_logger.info(f"[WebSocket] 忽略非目标课失败: fail={fail_id}, target={target_id_str}, msg={msg}")
+            return
+        if _is_full_msg(msg):
+            ws_fail_reason["value"] = "full"
+        else:
+            ws_fail_reason["value"] = "other_fail"
+        ws_fail_event.set()
+
+    # A: 先查迟到成功消息，再 clear 并注册回调
+    if ws_heartbeat:
+        if ws_heartbeat.check_success(target_id_str):
+            main_logger.info(f"发现迟到成功消息: {target_id_str}")
+            return True, "success"
+        ws_heartbeat.clear_success_messages()
+        ws_heartbeat.set_success_callback(on_success)
+        ws_heartbeat.set_fail_callback(on_fail)
+
+    try:
+        response = session.post(
+            URL_ADD_CLASS, headers=headers,
+            data=urlencode(body, quote_via=quote_plus), timeout=10
+        )
+        try:
+            result = response.json()
+        except json.JSONDecodeError:
+            # 非 JSON 可能是登录态失效；也可能其实已选上
+            success, new_token = handle_relogin(response)
+            if success and new_token:
+                # 重登后仍做一次复核，防止假失败
+                if _confirm_selected_by_list(session, new_token, batch_id, target_id, course_type):
+                    return True, "success"
+                return False, "relogin"
+            if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+                return True, "success"
+            return False, "exception"
+
+        code = result.get('code')
+        msg = str(result.get('msg', '无消息'))
+        main_logger.info(f"选课请求响应: code={code}, msg={msg}")
+
+        if _is_auth_failure(code, msg):
+            success, new_token = handle_relogin(response)
+            if success and new_token:
+                if _confirm_selected_by_list(session, new_token, batch_id, target_id, course_type):
+                    return True, "success"
+                return False, "relogin"
+            return False, "http_fail"
+
+        if code != 200:
+            # 已选/重复：列表或目标课程的 WS 成功消息必须至少确认一项。
+            if _is_already_selected_msg(msg):
+                if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+                    print(f"[✓] 接口提示已选且列表复核通过: {msg}")
+                    return True, "success"
+
+                print(f"[⏳] 接口提示已选，但列表未确认；等待目标课程 WS 确认（最长 {wait_timeout:.0f}s）...")
+                deadline = time.time() + wait_timeout
+                while time.time() < deadline:
+                    if ws_success_event.is_set():
+                        print(f"[✓] 接口提示已选且 WS 确认目标教学班: {msg}")
+                        return True, "success"
+                    if ws_heartbeat:
+                        msgs = ws_heartbeat.check_success(target_id_str)
+                        if msgs:
+                            print(f"[✓] 接口提示已选且 WS 轮询确认目标教学班: {msg}")
+                            return True, "success"
+                    if ws_fail_event.is_set():
+                        break
+                    time.sleep(0.1)
+
+                # WS 可能先于列表提交，等待后再复核一次；两者均未确认则不可退出。
+                if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+                    print(f"[✓] 接口提示已选，延迟列表复核通过: {msg}")
+                    return True, "success"
+                print(f"[!] 接口提示已选，但 WS/列表均未确认目标教学班，将继续抢课: {msg}")
+                main_logger.warning(f"已选文案未获 WS/列表确认: target={target_id_str}, msg={msg}")
+                return False, "other_fail"
+            if _is_full_msg(msg):
+                return False, "full"
+            # 其它失败也做一次列表复核（防止假失败 / 冲突文案但其实已选上）
+            if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+                print(f"[✓] 接口失败但列表复核已选上: {msg}")
+                return True, "success"
+            return False, "http_fail"
+
+        # code==200 仅表示入队，等 WS 确认
+        print(f"[→] 已加入选课队列，等待 WebSocket 确认（最长 {wait_timeout:.0f}s）...")
+        deadline = time.time() + wait_timeout
+        while time.time() < deadline:
+            if ws_success_event.is_set():
+                return True, "success"
+            if ws_fail_event.is_set():
+                reason = ws_fail_reason["value"]
+                if reason == "full":
+                    return False, "full"
+                # 其它 WS 失败也可能是假失败，列表复核一次
+                if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+                    return True, "success"
+                return False, reason
+            if ws_heartbeat:
+                # 只匹配有 clazzId 且等于目标的成功消息
+                msgs = ws_heartbeat.check_success(target_id_str)
+                if msgs:
+                    return True, "success"
+            time.sleep(0.1)
+
+        # 超时：列表复核
+        if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+            print("[✓] WebSocket 超时，但列表复核确认已选上")
+            return True, "success"
+
+        # 超时未确认：不视为成功，交由上层继续抢
+        print("[!] WebSocket 超时未确认成功，将继续尝试选课（不会再次退课）")
+        main_logger.warning("选课入队后 WS 超时未确认")
+        return False, "timeout"
+    except Exception as e:
+        print(f"[✗] 选课请求异常: {e}")
+        main_logger.error(f"选课请求异常: {e}")
+        # 异常路径也尝试复核一次
+        try:
+            if _confirm_selected_by_list(session, token, batch_id, target_id, course_type):
+                return True, "success"
+        except Exception:
+            pass
+        return False, "exception"
+    finally:
+        if ws_heartbeat:
+            ws_heartbeat.set_success_callback(None)
+            ws_heartbeat.set_fail_callback(None)
+
+
+def start_monitoring(session, token, batch_id, campus, target_class, drop_class_info,
+                     course_type=COURSE_TYPE_FANKC, ws_heartbeat=None, http_heartbeat=None):
+    """监控目标课程容量，检测到空位后：退旧课 → 抢新课。
+
+    状态机：
+      watching           监控容量，有空位才退课
+      dropped_pending_add 已退旧课，只抢目标，绝不再退
+                         目标失败时尝试回补旧课；回补成功则回到 watching
     """
     target_id = target_class['JXBID']
-    
-    # 获取课程显示名称
+    drop_id = drop_class_info['JXBID']
+    # 退课时尽量保留最新快照（含 secretVal），供回补使用
+    drop_snapshot = dict(drop_class_info)
+
     def get_display_name(clazz):
         if course_type == COURSE_TYPE_TYKC:
             return f"{clazz.get('projectName', clazz.get('KCM', '未知'))}({clazz.get('classificationName', '')})"
         return clazz.get('KCM', '未知')
-    
+
+    def sync_after_relogin(new_token):
+        """重登后同步主循环 token / HTTP 心跳 / WS cookie"""
+        nonlocal token
+        token = new_token
+        login_state.token = new_token
+        if http_heartbeat is not None:
+            http_heartbeat.update_token(new_token)
+        if ws_heartbeat and login_state.session is not None:
+            ws_heartbeat.update_cookies(dict(login_state.session.cookies))
+
+    def attempt_restore_dropped(current_token, reason_tag=""):
+        """目标未选上时，尝试把旧课加回。
+
+        Returns:
+            bool: 是否确认旧课已在选课结果中（含原本就还在 / 本次回补成功）
+        """
+        nonlocal drop_snapshot
+        live = _get_live_token(current_token)
+        tag = f"({reason_tag})" if reason_tag else ""
+        print(f"[↩] 尝试回补旧课{tag}: {get_display_name(drop_snapshot)} - {drop_snapshot.get('SKJS', '-')}")
+        main_logger.info(f"尝试回补旧课{tag}: JXBID={drop_id}")
+
+        # 已在已选列表则视为回补成功（可能未真正退掉 / 上次已加回）
+        if _confirm_selected_by_list(session, live, batch_id, drop_id, course_type):
+            print(f"[✓] 旧课已在选课结果中，无需再投: {get_display_name(drop_snapshot)}")
+            main_logger.info(f"回补跳过(列表已选): {drop_id}")
+            return True
+
+        # 尽量刷新 secretVal（全量列表里找该班）
+        restore_class = dict(drop_snapshot)
+        try:
+            _, _, latest = get_course_capacity(
+                session, live, batch_id, campus, drop_id, course_type
+            )
+            if latest and latest.get("secretVal"):
+                restore_class = dict(latest)
+                if not restore_class.get("KCM") and drop_snapshot.get("KCM"):
+                    restore_class["KCM"] = drop_snapshot.get("KCM")
+                drop_snapshot = restore_class
+        except Exception as e:
+            main_logger.warning(f"回补前刷新 secretVal 失败: {e}")
+
+        if not restore_class.get("secretVal"):
+            print("[✗] 回补失败：旧课缺少 secretVal，请手动登录教务核对课表")
+            main_logger.error(f"回补缺少 secretVal: {drop_id}")
+            return False
+
+        ok, reason = _try_add_class(
+            session, live, batch_id, restore_class, course_type,
+            ws_heartbeat=ws_heartbeat, wait_timeout=5.0,
+        )
+        if ok:
+            print(f"[✓] 旧课回补成功: {get_display_name(restore_class)} - {restore_class.get('SKJS', '-')}")
+            main_logger.info(f"旧课回补成功: {drop_id}")
+            return True
+
+        if reason == "relogin":
+            live2 = _get_live_token(live)
+            if live2:
+                sync_after_relogin(live2)
+                live = live2
+            # 重登后再确认一次列表
+            if _confirm_selected_by_list(session, live, batch_id, drop_id, course_type):
+                print(f"[✓] 重登后列表确认旧课已在: {get_display_name(restore_class)}")
+                return True
+
+        print(f"[✗] 旧课回补未成功({reason})，将继续抢目标（课表可能暂时为空）")
+        main_logger.warning(f"旧课回补失败: reason={reason}, JXBID={drop_id}")
+        return False
+
+    def handle_target_fail_then_restore(current_token, reason, force=False):
+        """目标抢失败后：累计失败次数，达阈值或 force 时尝试回补。
+
+        避免每次失败都回补导致「退→抢失败→回补→再退」空转。
+
+        Returns:
+            str: "restored" 回到 watching；"keep" 保持 dropped_pending_add
+        """
+        nonlocal state, pending_fail_streak, last_restore_ok_at
+        if reason == "relogin":
+            live = _get_live_token(token)
+            if live:
+                sync_after_relogin(live)
+                current_token = live
+
+        pending_fail_streak += 1
+        # force（Ctrl+C 不走这里）或连续失败达到阈值才回补
+        should_restore = force or pending_fail_streak >= RESTORE_AFTER_FAILS
+        if not should_restore:
+            print(
+                f"[!] 目标未成功({reason})，继续抢目标 "
+                f"({pending_fail_streak}/{RESTORE_AFTER_FAILS} 次后尝试回补旧课)"
+            )
+            main_logger.warning(
+                f"目标未成功暂不回补: reason={reason}, streak={pending_fail_streak}"
+            )
+            return "keep"
+
+        print(f"[!] 目标连续未成功({reason}, streak={pending_fail_streak})，尝试回补旧课以防空窗...")
+        main_logger.warning(f"目标未成功，尝试回补: {reason}, streak={pending_fail_streak}")
+        if attempt_restore_dropped(current_token, reason_tag=reason):
+            state = "watching"
+            pending_fail_streak = 0
+            last_restore_ok_at = time.time()
+            print(
+                f"[→] 已回补旧课，回到监控（{RESTORE_COOLDOWN_SEC:.0f}s 内不重复退课，"
+                "之后有空位再换）"
+            )
+            main_logger.info("状态切换: dropped_pending_add -> watching (回补成功)")
+            return "restored"
+        # 回补失败：保持已退，重置计数以便隔几次再试回补
+        pending_fail_streak = 0
+        print("[!] 回补失败，保持「已退待选」，继续抢目标（不会再退课）")
+        return "keep"
+
     target_name = get_display_name(target_class)
     drop_name = get_display_name(drop_class_info)
-    
+
+    # watching | dropped_pending_add
+    # 已退待选时目标连续失败次数；达 RESTORE_AFTER_FAILS 才回补，防抖
+    RESTORE_AFTER_FAILS = 3
+    RESTORE_COOLDOWN_SEC = 20.0  # 回补成功后冷却，避免立刻再退再抢空转
+    state = "watching"
+    check_count = 0
+    auth_fail_streak = 0
+    pending_fail_streak = 0
+    last_restore_ok_at = 0.0
+
     print("\n" + "="*60)
     print(f"监控目标课程: {target_name} - {target_class['SKJS']}")
     print(f"准备退掉课程: {drop_name} - {drop_class_info['SKJS']}")
-    print("每 5 秒检测一次课容量，检测到空位后自动退课并选课。")
-    print("按 Ctrl+C 停止监控。")
+    print("每 5 秒检测一次课容量；空位时退课→选课。")
+    print(
+        f"状态保护：退课后持续抢目标；连续 {RESTORE_AFTER_FAILS} 次未中则尝试回补旧课，"
+        f"回补成功后 {RESTORE_COOLDOWN_SEC:.0f}s 内不再退。"
+    )
+    print("Ctrl+C 中断时会立即尝试回补旧课。")
     print("="*60 + "\n")
-    
+
     main_logger.info(f"开始监控: 目标={target_name}, 退课={drop_name}")
-    
-    current_token = token
-    check_count = 0
-    
+
     try:
         while True:
             check_count += 1
+            current_token = _get_live_token(token)
+            if current_token and current_token != token:
+                # 心跳可能已重登，同步到本循环与 HTTP 心跳对象
+                sync_after_relogin(current_token)
+
             current_selected, capacity, updated_class = get_course_capacity(
                 session, current_token, batch_id, campus, target_id, course_type
             )
-            
+
             if current_selected is None:
-                print(f"[{check_count}] 查询失败，5秒后重试...", end='\r')
+                # 已退待选：容量查询失败也不跳过，用 target_class 快照继续抢
+                if state == "dropped_pending_add":
+                    auth_fail_streak += 1
+                    print(f"[{check_count}] 查询失败，但仍处于已退待选，继续投递... ({auth_fail_streak})")
+                    if auth_fail_streak >= 3:
+                        print(f"\n[!] 连续查询失败，尝试重新登录...")
+                        success, new_token = handle_relogin(None)
+                        if success and new_token:
+                            sync_after_relogin(new_token)
+                            auth_fail_streak = 0
+                            current_token = _get_live_token(token) or new_token
+                            print("[✓] 重新登录成功，继续抢课")
+                        else:
+                            print("[✗] 重新登录失败，稍后仍会用现有会话尝试选课")
+                    select_class = target_class
+                    dt = datetime.datetime.now().strftime("%H:%M:%S")
+                    print(f"\n[{dt}] [已退待选] 查询失败，用快照继续抢: {target_name}")
+                    ok, reason = _try_add_class(
+                        session, current_token, batch_id, select_class, course_type,
+                        ws_heartbeat=ws_heartbeat, wait_timeout=5.0
+                    )
+                    if ok:
+                        print(f"\n[✓] 选课成功！{target_name} - {target_class['SKJS']}")
+                        main_logger.info(f"选课成功(已退待选/查询失败路径): {target_name}")
+                        break
+                    handle_target_fail_then_restore(current_token, reason)
+                    time.sleep(1)
+                    continue
+
+                # watching：查询失败走 streak 重登，不投递
+                auth_fail_streak += 1
+                print(f"[{check_count}] 查询失败，重试中... ({auth_fail_streak})", end='\r')
+                # 连续失败时尝试重登（token 可能已过期但响应仍是 JSON 失败）
+                if auth_fail_streak >= 3:
+                    print(f"\n[!] 连续查询失败，尝试重新登录...")
+                    success, new_token = handle_relogin(None)
+                    if success and new_token:
+                        sync_after_relogin(new_token)
+                        auth_fail_streak = 0
+                        print("[✓] 重新登录成功，继续监控")
+                    else:
+                        print("[✗] 重新登录失败，稍后重试")
                 time.sleep(5)
                 continue
-            
+
+            auth_fail_streak = 0
             dt = datetime.datetime.now().strftime("%H:%M:%S")
-            
-            if current_selected < capacity:
-                # 有空位！
+            has_slot = current_selected < capacity
+
+            # ---- 状态：已退后只抢目标；失败则回补 ----
+            if state == "dropped_pending_add":
+                # 即使当前看起来已满也继续投递（可能瞬时有人退）
+                select_class = updated_class if updated_class else target_class
+                print(f"\n[{dt}] [已退待选] 继续抢目标: {target_name} ({current_selected}/{capacity})")
+                ok, reason = _try_add_class(
+                    session, current_token, batch_id, select_class, course_type,
+                    ws_heartbeat=ws_heartbeat, wait_timeout=5.0
+                )
+                if ok:
+                    print(f"\n[✓] 选课成功！{target_name} - {target_class['SKJS']}")
+                    main_logger.info(f"选课成功(已退待选): {target_name}")
+                    break
+                handle_target_fail_then_restore(current_token, reason)
+                time.sleep(1)
+                continue
+
+            # ---- 状态：watching ----
+            if has_slot:
+                # 刚回补成功后的冷却：避免「回补→立刻又退」抖动
+                if last_restore_ok_at and (time.time() - last_restore_ok_at) < RESTORE_COOLDOWN_SEC:
+                    remain = RESTORE_COOLDOWN_SEC - (time.time() - last_restore_ok_at)
+                    print(
+                        f"[{dt}] 有空位，但回补冷却中({remain:.0f}s)，暂不退课 "
+                        f"{target_name}: {current_selected}/{capacity}",
+                        end='\r',
+                    )
+                    time.sleep(min(5, max(1, remain)))
+                    continue
+
                 print(f"\n[{dt}] 检测到空位！当前 {current_selected}/{capacity}")
                 main_logger.info(f"检测到空位: {current_selected}/{capacity}")
-                
-                # 1. 先退课
+
+                # 1. 退课（仅 watching 状态执行一次）
                 print(f"[>] 正在退课: {drop_name}...")
-                drop_success = drop_class(session, current_token, batch_id, drop_class_info, course_type)
-                
+                # 尝试用最新 secretVal（若列表里能找到该已选课）
+                drop_info = drop_class_info
+                try:
+                    _, _, latest_drop = get_course_capacity(
+                        session, current_token, batch_id, campus,
+                        drop_class_info['JXBID'], course_type
+                    )
+                    if latest_drop and latest_drop.get('secretVal'):
+                        drop_info = latest_drop
+                        drop_snapshot = dict(latest_drop)
+                        if not drop_snapshot.get("KCM") and drop_class_info.get("KCM"):
+                            drop_snapshot["KCM"] = drop_class_info.get("KCM")
+                except Exception:
+                    pass
+
+                drop_success = drop_class(session, current_token, batch_id, drop_info, course_type)
+                # drop 可能触发重登，同步 token / 心跳 / WS
+                live_after_drop = _get_live_token(current_token)
+                if live_after_drop and live_after_drop != current_token:
+                    sync_after_relogin(live_after_drop)
+                    current_token = live_after_drop
                 if not drop_success:
-                    print("[!] 退课失败，继续监控...")
+                    print("[!] 退课失败，继续监控（不进入待选状态）...")
                     main_logger.warning("退课失败，继续监控")
                     time.sleep(5)
                     continue
-                
-                # 2. 再选课（使用更新后的 secretVal）
-                print(f"[>] 正在选课: {target_name}...")
-                
-                headers = {
-                    **COMMON_HEADERS,
-                    "Authorization": current_token,
-                    "batchId": batch_id,
-                    "Content-Type": "application/x-www-form-urlencoded"
-                }
-                
-                # 使用查询到的最新课程信息（含新的 secretVal）
+
+                # 退课成功 → 进入待选，后续绝不再退；快照供回补
+                drop_snapshot = dict(drop_info)
+                state = "dropped_pending_add"
+                pending_fail_streak = 0
+                print(
+                    f"[✓] 退课成功，进入「已退待选」"
+                    f"（连续 {RESTORE_AFTER_FAILS} 次目标失败会尝试回补）"
+                )
+                main_logger.info("状态切换: watching -> dropped_pending_add")
+
+                # 2. 立刻选课
                 select_class = updated_class if updated_class else target_class
-                body = {
-                    "clazzType": course_type,
-                    "clazzId": select_class['JXBID'],
-                    "secretVal": select_class['secretVal']
-                }
-                
-                try:
-                    response = session.post(URL_ADD_CLASS, headers=headers, 
-                                          data=urlencode(body, quote_via=quote_plus), timeout=10)
-                    result = response.json()
-                    code = result.get('code')
-                    msg = result.get('msg', '无消息')
-                    
-                    if code == 200:
-                        print(f"\n[✓] 选课成功！{target_name} - {target_class['SKJS']}")
-                        main_logger.info(f"选课成功: {target_name}")
-                        break
-                    else:
-                        print(f"[✗] 选课失败: {code} - {msg}")
-                        main_logger.warning(f"选课失败: {code} - {msg}")
-                        print("[!] 继续监控...")
-                except Exception as e:
-                    print(f"[✗] 选课请求异常: {e}")
-                    main_logger.error(f"选课请求异常: {e}")
-            else:
-                # 课程已满
-                print(f"[{dt}] [{check_count}] {target_name}: {current_selected}/{capacity} (已满)", end='\r')
-            
+                print(f"[>] 正在选课: {target_name}...")
+                ok, reason = _try_add_class(
+                    session, current_token, batch_id, select_class, course_type,
+                    ws_heartbeat=ws_heartbeat, wait_timeout=5.0
+                )
+                if ok:
+                    print(f"\n[✓] 选课成功！{target_name} - {target_class['SKJS']}")
+                    main_logger.info(f"选课成功: {target_name}")
+                    break
+
+                handle_target_fail_then_restore(current_token, reason)
+                time.sleep(1)
+                continue
+
+            # 已满
+            print(f"[{dt}] [{check_count}] {target_name}: {current_selected}/{capacity} (已满) [{state}]", end='\r')
             time.sleep(5)
-    
+
     except KeyboardInterrupt:
         print("\n\n监控已由用户手动停止。")
+        if state == "dropped_pending_add":
+            print("[!] 中断时处于「已退待选」，正在尝试回补旧课...")
+            main_logger.warning("用户中断时处于 dropped_pending_add，尝试回补")
+            live = _get_live_token(token)
+            restored = attempt_restore_dropped(live, reason_tag="Ctrl+C")
+            if restored:
+                print("[✓] 中断回补成功，请仍建议登录教务核对课表。")
+            else:
+                print("[!] 警告：旧课可能已退、目标可能未选上，请立刻登录教务核对课表！")
         main_logger.info("监控已停止")
-
-
-def start_grabbing(session, token, batch_id, selected_class, backup_classes=None, course_type=COURSE_TYPE_FANKC):
-    """开始循环抢课，支持备选课程切换
-    
-    Args:
-        course_type: 课程类型，COURSE_TYPE_FANKC(泛选课) 或 COURSE_TYPE_TYKC(体育课)
-    """
-    if backup_classes is None:
-        backup_classes = []
-    
-    # 构建课程队列：主课程 + 备选课程
-    course_queue = [selected_class] + backup_classes
-    current_index = 0
-    
-    current_class = course_queue[current_index]
-    class_id = current_class['JXBID']
-    secret_val = current_class['secretVal']
-    
-    # 获取课程显示名称（体育课用项目名，泛选课用课程名）
-    def get_display_name(clazz):
-        if course_type == COURSE_TYPE_TYKC:
-            return f"{clazz.get('projectName', clazz['KCM'])}({clazz.get('classificationName', '')})"
-        return clazz['KCM']
-
-    print("\n" + "="*50)
-    print(f"准备抢课: {get_display_name(current_class)} - {current_class['SKJS']}")
-    if backup_classes:
-        print(f"备选课程数量: {len(backup_classes)}")
-    print("按 Ctrl+C 停止脚本。")
-    print("="*50 + "\n")
-
-    # 使用当前token（可能会在重登后更新）
-    current_token = token
-    
-    def build_headers(tk):
-        return {
-            **COMMON_HEADERS,
-            "Authorization": tk,
-            "batchId": batch_id,
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-    
-    def build_body(clazz):
-        body = {
-            "clazzType": course_type,  # 根据课程类型设置
-            "clazzId": clazz['JXBID'],
-            "secretVal": clazz['secretVal']
-        }
-        return urlencode(body, quote_via=quote_plus)
-
-    headers = build_headers(current_token)
-    encoded_body = build_body(current_class)
-    
-    # 连续JSON解析失败计数
-    json_fail_count = 0
-    MAX_JSON_FAIL = 3  # 连续失败3次后触发重登
-
-    try:
-        while True:
-            try:
-                response = session.post(URL_ADD_CLASS, headers=headers, data=encoded_body, timeout=5)
-                
-                try:
-                    result = response.json()
-                    json_fail_count = 0  # 重置计数
-                except json.JSONDecodeError as e:
-                    json_fail_count += 1
-                    print(f"\n[!] JSON解析失败 ({json_fail_count}/{MAX_JSON_FAIL}): {e}")
-                    main_logger.warning(f"JSON解析失败: {e}, 响应内容: {response.text[:200]}")
-                    
-                    if json_fail_count >= MAX_JSON_FAIL:
-                        print(f"\n[!] 连续{MAX_JSON_FAIL}次JSON解析失败，触发重新登录...")
-                        main_logger.warning(f"连续{MAX_JSON_FAIL}次JSON解析失败，开始重登流程")
-                        
-                        # 执行重登逻辑
-                        success, new_token = handle_relogin(response)
-                        if success and new_token:
-                            current_token = new_token
-                            headers = build_headers(current_token)
-                            json_fail_count = 0
-                            print("[✓] 重新登录成功，继续抢课...")
-                        else:
-                            print("[✗] 重新登录失败，等待后重试...")
-                            time.sleep(5)
-                    
-                    time.sleep(0.5)
-                    continue
-                
-                code = result.get('code')
-                msg = result.get('msg', '没有消息')
-
-                main_logger.info(f"[{get_display_name(current_class)} - {current_class['SKJS']}] {code}: {msg}")
-
-                # 课程已满，尝试切换到备选课程
-                if msg.find("满") != -1:
-                    print(f"\n[!] 当前课程 [{get_display_name(current_class)} - {current_class['SKJS']}] 已满")
-                    
-                    # 尝试切换到下一个备选课程
-                    if current_index < len(course_queue) - 1:
-                        current_index += 1
-                        current_class = course_queue[current_index]
-                        encoded_body = build_body(current_class)
-                        print(f"[->] 切换到备选课程 {current_index}: {get_display_name(current_class)} - {current_class['SKJS']}")
-                        main_logger.info(f"切换到备选课程: {get_display_name(current_class)}")
-                    else:
-                        print("[!] 所有课程（含备选）均已满，继续尝试最后一个课程...")
-
-                # 根据 code 决定输出格式
-                if code != 403:
-                    # 403 通常是高频请求限制，不重要
-                    dt = datetime.datetime.now()
-                    course_name = get_display_name(current_class)[:10]  # 截断显示
-                    print(f"[{course_name}] 状态: {code}, 信息: {msg} {dt}", end='\r')
-                
-                # 如果是成功或其他需要注意的错误，换行并打印完整 JSON
-                if code not in [500, 403, 0]: # 500 是常见系统错误, 403 是频率限制, 0 是已满
-                    print(f"\n收到关键响应: {json.dumps(result, ensure_ascii=False)}")
-                
-                # 成功选课 code == 200
-                if code == 200:
-                    print(f"\n[✓] 选课成功！课程: {get_display_name(current_class)} - {current_class['SKJS']}")
-                    main_logger.info(f"选课成功: {get_display_name(current_class)}")
-                    break
-                
-            except requests.exceptions.RequestException as e:
-                print(f"请求失败: {e}", end='\r')
-
-            time.sleep(0.3) # 可调整请求间隔，避免过快
-
-    except KeyboardInterrupt:
-        print("\n\n脚本已由用户手动停止。")
-        input("按回车键退出...")
-        sys.exit(0)
-
-
-def confirm_course_selection(selected_classes, course_type=COURSE_TYPE_FANKC):
-    """显示课程选择信息并请求用户确认
-    
-    Args:
-        selected_classes: 选择的课程列表（第一个为主选，其余为备选）
-        course_type: 课程类型
-        
-    Returns:
-        tuple: (confirmed: bool, selected_class, backup_classes)
-    """
-    selected_class = selected_classes[0]
-    backup_classes = selected_classes[1:] if len(selected_classes) > 1 else []
-    
-    # 获取课程显示名称
-    def get_display_name(clazz):
-        if course_type == COURSE_TYPE_TYKC:
-            return f"{clazz.get('projectName', clazz['KCM'])}({clazz.get('classificationName', '')})"
-        return clazz['KCM']
-    
-    print(f"\n已选择主课程: {get_display_name(selected_class)} - {selected_class['SKJS']} [{selected_class['YXRS']}/{selected_class['KRL']}]\n\t{selected_class.get('teachingPlace', '未安排地点')}")
-    
-    if backup_classes:
-        print(f"\n备选课程 ({len(backup_classes)} 个):")
-        for i, bc in enumerate(backup_classes):
-            print(f"  备选{i+1}: {get_display_name(bc)} - {bc['SKJS']} [{bc['YXRS']}/{bc['KRL']}]\n\t{bc.get('teachingPlace', '未安排地点')}")
-    
-    confirm = input("\n是否确认提交选择？(y/n): ").strip().lower()
-    return confirm == 'y', selected_class, backup_classes
 
 
 def init_vpn_login(session, username, password):
     """初始化VPN登录
-    
+
     Args:
         session: requests.Session 对象
         username: 用户名
         password: 密码
-        
+
     Returns:
         NuistVPNClient or None: VPN客户端对象，失败时返回None
     """
     if not username or not password:
         print("错误: 使用VPN模式时必须提供 -u/--username 和 -p/--password 参数")
         return None
-    
+
     client = NuistVPNClient(username=username, password=password)
     cookies_dict = client.login_and_get_cookies()
     session.cookies.update(cookies_dict)
@@ -1402,39 +1994,47 @@ def init_login(session, username, password, skip_login=False):
 
 
 def run_course_selection(session, token, batch_id, campus, username, use_vpn, course_type=COURSE_TYPE_FANKC):
-    """运行监控抢课流程
-    
+    """运行监控换课流程
+
     流程：
     1. 选择目标课程（只选1个）
-    2. 选择要退的已选课程
+    2. 从已选课程中选择要退的课
     3. 确认后开始监控
-    4. 检测到空位：退课 → 选课
-    
-    Args:
-        session: requests.Session 对象
-        token: 认证token
-        batch_id: 选课批次ID
-        campus: 校区
-        username: 学号（用于WebSocket）
-        use_vpn: 是否使用VPN
-        course_type: 课程类型
+    4. 检测到空位：退课 → 选课（失败则保持已退状态继续抢）
     """
+    student_id = username
+    if not student_id:
+        print("错误: 学号无效，无法建立 WebSocket（请提供 -u 或确保 login_data 含学号）")
+        main_logger.error("WebSocket student_id 无效，退出")
+        return
+
+    # 先创建 WS，再挂 HTTP 心跳的 on_relogin 以便重登后同步 cookie
+    ws_heartbeat = WebSocketHeartbeat(
+        student_id=student_id,
+        cookies=dict(session.cookies),
+        use_vpn=use_vpn
+    )
+
+    def on_http_relogin(new_token):
+        """HTTP 心跳重登成功后同步 token 与 WS cookies"""
+        login_state.token = new_token
+        try:
+            ws_heartbeat.update_cookies(dict(session.cookies))
+        except Exception as e:
+            heartbeat_logger.warning(f"on_relogin 同步 WS cookie 失败: {e}")
+
     # 启动 HTTP 心跳（维持登录态，每30秒请求一次课程列表）
     http_heartbeat = HttpHeartbeat(
         session=session,
         token=token,
         batch_id=batch_id,
         campus=campus,
-        interval=30
+        interval=30,
+        on_relogin=on_http_relogin,
     )
     http_heartbeat.start()
 
-    # 启动 WebSocket 心跳
-    ws_heartbeat = WebSocketHeartbeat(
-        student_id=username,
-        cookies=dict(session.cookies),
-        use_vpn=use_vpn
-    )
+    # 启动 WebSocket 心跳（用于确认真实选课成功）
     ws_heartbeat.start()
 
     try:
@@ -1443,55 +2043,83 @@ def run_course_selection(session, token, batch_id, campus, username, use_vpn, co
         result = choose_class(session, token, batch_id, campus, course_type)
         if result is None or result[0] is None:
             return
+        if result[0] == "BACK":
+            print("已返回上一级。")
+            return
+
         selected_classes, all_classes = result
-        
+        if not isinstance(selected_classes, list) or not selected_classes:
+            print("未选择有效目标课程。")
+            return
+
         # 只取第一个作为目标课程
         target_class = selected_classes[0]
-        
-        # 获取课程显示名称
+
         def get_display_name(clazz):
             if course_type == COURSE_TYPE_TYKC:
                 return f"{clazz.get('projectName', clazz.get('KCM', '未知'))}({clazz.get('classificationName', '')})"
             return clazz.get('KCM', '未知')
-        
+
         print(f"\n目标课程: {get_display_name(target_class)} - {target_class['SKJS']} [{target_class['YXRS']}/{target_class['KRL']}]")
-        print(f"上课地点: {target_class['teachingPlace']}")
-        
-        # 2. 选择要退的课程（直接复用前面获取的课程列表）
-        print("\n--- 第二步：选择要退掉的课程（从上面列表中选择）---")
+        print(f"上课地点: {target_class.get('teachingPlace', '未安排地点')}")
+
+        # 2. 独立拉取已选课（不依赖目标课列表页 all_classes）
+        print("\n--- 第二步：从已选课中选择要退掉的课 ---")
+        print("正在拉取已选课程列表...")
+        selected_only = fetch_selected_classes(
+            session, _get_live_token(token), batch_id, campus, course_type,
+            exclude_jxbid=target_class.get("JXBID"),
+        )
+
+        if not selected_only:
+            print("\n[!] 未找到可退的已选课程（SFYX=1）。")
+            print("    请确认：当前轮次下是否已有已选课；或列表分页/类型不匹配。")
+            return
+
+        for i, clazz in enumerate(selected_only, 1):
+            place = clazz.get('teachingPlace') or '未安排地点'
+            print(
+                f"  [{i}] {get_display_name(clazz)} - {clazz.get('SKJS', '-')} "
+                f"[{clazz.get('YXRS', '?')}/{clazz.get('KRL', '?')}]\n"
+                f"      {place}"
+            )
+
         while True:
             try:
-                drop_choice = int(input("请输入要退掉的课程序号: ").strip())
-                if 1 <= drop_choice <= len(all_classes):
-                    drop_class_info = all_classes[drop_choice - 1]
+                drop_choice = int(input("请输入要退掉的已选课程序号: ").strip())
+                if 1 <= drop_choice <= len(selected_only):
+                    drop_class_info = selected_only[drop_choice - 1]
                     break
                 else:
                     print("无效的序号，请重新输入。")
             except ValueError:
                 print("请输入有效的数字。")
-        
+
         print(f"\n要退的课程: {get_display_name(drop_class_info)} - {drop_class_info['SKJS']}")
-        print(f"上课地点: {drop_class_info['teachingPlace']}")
-        
+        print(f"上课地点: {drop_class_info.get('teachingPlace', '未安排地点')}")
+
         # 3. 确认
         print("\n" + "="*50)
         print("确认信息：")
         print(f"  目标课程: {get_display_name(target_class)} - {target_class['SKJS']}")
         print(f"  要退课程: {get_display_name(drop_class_info)} - {drop_class_info['SKJS']}")
+        print("  注意：退课后会持续抢目标；多次未中会尝试回补旧课，Ctrl+C 也会回补。")
         print("="*50)
-        
+
         confirm = input("\n确认开始监控？(y/n): ").strip().lower()
         if confirm != 'y':
             print("操作已取消。")
             return
-        
+
         # 4. 开始监控
-        start_monitoring(session, token, batch_id, campus, target_class, drop_class_info, course_type)
-        
+        start_monitoring(
+            session, token, batch_id, campus, target_class, drop_class_info,
+            course_type=course_type, ws_heartbeat=ws_heartbeat, http_heartbeat=http_heartbeat,
+        )
+
     finally:
         http_heartbeat.stop()
         ws_heartbeat.stop()
-
 
 def parse_arguments():
     """解析命令行参数
@@ -1528,6 +2156,8 @@ def validate_arguments(args):
     """
     if args.skip_login:
         cookie_file_path = args.cookie_file if args.cookie_file else DEFAULT_COOKIE_FILE
+        if not args.username or not args.password:
+            print("[!] 提示: --skip-login 未提供 -u/-p，会话失效时无法自动重登")
         return True, cookie_file_path
     else:
         if not args.username or not args.password:
@@ -1547,8 +2177,8 @@ def main():
     valid, cookie_file_path = validate_arguments(args)
     if not valid:
         return
-    
-    # 初始化日志系统（使用学号，如果有的话）
+
+    # 初始化日志系统（使用学号，如果有的话；skip-login 后续会用 login_data 补全）
     if args.username:
         setup_logging(args.username)
     else:
@@ -1557,16 +2187,16 @@ def main():
     # 2. 初始化 Session
     session = requests.Session()
     session.headers.update(COMMON_HEADERS)
-    
+
     # 初始化全局登录状态
     login_state.session = session
     login_state.username = args.username
     login_state.password = args.password
-    
+
     # 3. VPN 登录（如果需要）
     use_vpn = BASE_URL.startswith("https://client.vpn.nuist.edu.cn")
     login_state.use_vpn = use_vpn
-    
+
     if use_vpn:
         vpn_client = init_vpn_login(session, args.username, args.password)
         if not vpn_client:
@@ -1577,15 +2207,27 @@ def main():
     if cookie_file_path:
         if not load_cookie_file(session, cookie_file_path):
             return
-    
+
     # 5. 登录或跳过登录
     session.get(BASE_URL)  # 访问首页以建立会话
     login_data, token = init_login(session, args.username, args.password, args.skip_login)
     if not login_data:
         return
-    
+
     login_state.token = token
     login_state.campus = login_data.get("student", {}).get("campus")
+
+    # skip-login 时从 login_data 补全学号，供 WS / 重登使用
+    student_id = args.username or _extract_student_id(login_data)
+    if student_id:
+        login_state.username = student_id
+        if not args.username:
+            # 补全日志目录（原先用 unknown）
+            setup_logging(student_id)
+    else:
+        print("错误: 无法获取学号（请提供 -u 或确保用户信息含 XH）")
+        main_logger.error("学号无效，退出")
+        return
 
     # 6. 选择轮次
     batch, course_type = choose_elective_batch(login_data)
@@ -1600,7 +2242,7 @@ def main():
         token=token,
         batch_id=batch_id,
         campus=login_state.campus,
-        username=args.username,
+        username=student_id,
         use_vpn=use_vpn,
         course_type=course_type
     )
