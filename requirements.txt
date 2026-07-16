@@ -1,0 +1,8 @@
+requests
+pycryptodome
+ddddocr
+websocket-client
+rich
+beautifulsoup4
+certifi
+truststore

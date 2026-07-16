@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 敏感信息 / 运行时文件
+ck.txt
+vpn_cookie.txt
+*.cookie
+.env
+.env.*
+
+# 日志
+logs/
+*.log
+
+# 本地备份 / 压缩包
+*.7z
+*.zip
+*.rar
+
+# IDE / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
