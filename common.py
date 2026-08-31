@@ -31,7 +31,21 @@ AES_KEY = "MWMqg2tPcDkxcm11".encode('utf-8')
 
 # 课程类型常量
 COURSE_TYPE_FANKC = "FANKC"  # 方案内课程
-COURSE_TYPE_TYKC = "TYKC"    # 体育课
+COURSE_TYPE_TYKC = "TYKC"    # 体育课（南信大配置为「板块选课」）
+
+# 非选课类型：出现在 menuList 里但不能用于 clazz/list 抢课
+NON_SELECTABLE_TYPES = ("XSKB", "YXKC", "SCKC", "YJSKC", "ALLKC")
+
+# teachingClassType 兜底显示名（服务端 menuList 已带 displayName，这里仅用于兜底）
+COURSE_TYPE_NAMES = {
+    "FANKC": "本专业跨年级课程",
+    "TJKC": "本专业推荐课程",
+    "FAWKC": "跨专业课程",
+    "CXKC": "重修课程",
+    "TYKC": "板块选课",
+    "XGKC": "通识选修课",
+    "FXKC": "辅修课程",
+}
 
 # API 端点
 BASE_URL = "https://client.vpn.nuist.edu.cn/https/webvpn3315a96df5a2811a49489fcebfe8b135dece10c6255d04cc36c652f60ee89b3a/xsxk"
@@ -43,6 +57,7 @@ URL_ADD_CLASS = f"{BASE_URL}/elective/clazz/add?enlink-vpn"
 URL_DEL_CLASS = f"{BASE_URL}/elective/clazz/del?enlink-vpn"
 URL_SWITCH_BATCH = f"{BASE_URL}/elective/user?enlink-vpn"
 URL_GET_USER_INFO = f"{BASE_URL}/elective/user?enlink-vpn"
+URL_GRABLESSONS = f"{BASE_URL}/elective/grablessons?enlink-vpn"
 DEFAULT_COOKIE_FILE = "ck.txt"
 
 # 通用请求头
@@ -292,6 +307,156 @@ def switch_batch(session, token, batch_id):
     except Exception as e:
         main_logger.warning(f"切换轮次请求异常: {e}")
         return False
+
+
+def _extract_js_literal(text, assign_pattern):
+    """从内联脚本中截取 `xxx = {...}` / `xxx = [...]` 字面量并解析为 Python 对象。
+
+    用括号配对扫描而非正则截取，避免嵌套结构被截断。
+
+    Returns:
+        dict/list or None
+    """
+    match = re.search(assign_pattern, text)
+    if not match:
+        return None
+
+    start = match.end()
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
+    if start >= len(text) or text[start] not in "{[":
+        return None
+
+    closing = {"{": "}", "[": "]"}
+    stack = [text[start]]
+    i = start + 1
+    in_str = False
+    escaped = False
+    while i < len(text) and stack:
+        ch = text[i]
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in closing:
+            stack.append(ch)
+        elif ch in ("}", "]"):
+            if closing[stack[-1]] != ch:
+                return None
+            stack.pop()
+        i += 1
+
+    if stack:
+        return None
+    try:
+        return json.loads(text[start:i])
+    except json.JSONDecodeError as e:
+        main_logger.warning(f"解析内联 JS 字面量失败: {e}")
+        return None
+
+
+def fetch_batch_menu_list(session, token, batch_id):
+    """拉取 grablessons 页面，解析该轮次服务端下发的 menuList。
+
+    平台把「本轮次有哪些 teachingClassType」放在这个页面的内联 JS 里，
+    JSON 接口（含 elective/user）并不返回，所以只能从 HTML 取。
+
+    Returns:
+        list: [{"teachingClassType": ..., "displayName": ...}, ...]，失败返回 []
+    """
+    headers = {**COMMON_HEADERS, "Authorization": token}
+    try:
+        response = session.get(
+            URL_GRABLESSONS, headers=headers,
+            params={"batchId": batch_id}, timeout=15
+        )
+        response.raise_for_status()
+        html = response.text
+    except Exception as e:
+        main_logger.warning(f"请求 grablessons 页面失败: {e}")
+        return []
+
+    # 优先取当前轮次自己的 menuList，它才是「本轮次可选类型」
+    current_batch = _extract_js_literal(
+        html, r"grablessonsVue\.lcParam\.currentBatch\s*="
+    )
+    if isinstance(current_batch, dict) and current_batch.get("menuList"):
+        # 页面返回的轮次与请求的不一致时不可用（否则会读到别的轮次的菜单）
+        page_code = current_batch.get("code")
+        if page_code and page_code != batch_id:
+            main_logger.warning(
+                f"grablessons 页面轮次不匹配: 请求 {batch_id}，返回 {page_code}"
+            )
+        else:
+            return current_batch["menuList"]
+
+    # 兜底：顶部导航菜单（含我的课表/已选课程等非选课项，由调用方过滤）
+    menu_list = _extract_js_literal(
+        html, r"grablessonsVue\.menuData\.menuList\s*="
+    )
+    if isinstance(menu_list, list):
+        return menu_list
+
+    main_logger.warning("未能从 grablessons 页面解析出 menuList")
+    return []
+
+
+def resolve_course_type(session, token, batch_id, batch_name=""):
+    """确定该轮次要用的 teachingClassType。
+
+    以服务端 menuList 为准，不靠轮次名称猜：南信大把 TYKC 显示成「板块选课」，
+    轮次名里既没有「体育」也没有任何类型线索，按名称猜会错到另一个类型上。
+
+    Returns:
+        str or None: teachingClassType；用户选择返回时为 None
+    """
+    menu_list = fetch_batch_menu_list(session, token, batch_id)
+    candidates = [
+        m for m in menu_list
+        if isinstance(m, dict)
+        and m.get("teachingClassType")
+        and m["teachingClassType"] not in NON_SELECTABLE_TYPES
+    ]
+
+    def display_of(menu):
+        return (menu.get("displayName")
+                or COURSE_TYPE_NAMES.get(menu["teachingClassType"], "未知类型"))
+
+    if not candidates:
+        fallback = COURSE_TYPE_TYKC if "体育" in (batch_name or "") else COURSE_TYPE_FANKC
+        print(f"[!] 未能获取本轮次可选课程类型，按轮次名回退为 {fallback}")
+        main_logger.warning(f"menuList 无可选类型，course_type 回退: {fallback}")
+        return fallback
+
+    if len(candidates) == 1:
+        only = candidates[0]
+        print(f"[✓] 本轮次课程类型: {display_of(only)}({only['teachingClassType']})")
+        main_logger.info(f"course_type 自动确定: {only['teachingClassType']}")
+        return only["teachingClassType"]
+
+    print("\n--- 本轮次支持多种课程类型，请选择 ---")
+    for i, menu in enumerate(candidates, 1):
+        print(f"  [{i}] {display_of(menu)}({menu['teachingClassType']})")
+    print("  [0] 返回")
+
+    while True:
+        try:
+            choice = int(input("请输入课程类型序号 (0返回): ").strip())
+        except ValueError:
+            print("请输入一个有效的数字。")
+            continue
+        if choice == 0:
+            return None
+        if 1 <= choice <= len(candidates):
+            picked = candidates[choice - 1]["teachingClassType"]
+            main_logger.info(f"course_type 用户选择: {picked}")
+            return picked
+        print("无效的输入，请输入列表中的数字。")
 
 
 def relogin_system():

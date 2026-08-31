@@ -36,6 +36,7 @@ from common import (
     _extract_student_id,
     _extract_ws_clazz_id,
     handle_relogin,
+    resolve_course_type,
     HttpHeartbeat,
     WebSocketHeartbeat,
     load_cookie_file,
@@ -161,8 +162,10 @@ def choose_course_from_list(courses, course_type=COURSE_TYPE_FANKC):
             print("请输入一个有效的数字。")
 
 
-def choose_elective_batch(student_data):
+def choose_elective_batch(student_data, session=None, token=None):
     """让用户选择一个可选的选课轮次
+
+    课程类型由服务端 menuList 决定（见 resolve_course_type），不按轮次名猜。
 
     Returns:
         tuple: (batch, course_type) 或 (None, None)
@@ -178,10 +181,7 @@ def choose_elective_batch(student_data):
         return None, None
 
     for i, batch in enumerate(available_batches):
-        # 判断课程类型并标注
-        batch_name = batch['name']
-        type_tag = "[体育]" if "体育" in batch_name else "[方案内课程]"
-        print(f"  [{i+1}] {type_tag} {batch_name} ({batch['beginTime']} - {batch['endTime']})")
+        print(f"  [{i+1}] {batch['name']} ({batch['beginTime']} - {batch['endTime']})")
     print("  [0] 退出程序")
 
     while True:
@@ -192,8 +192,13 @@ def choose_elective_batch(student_data):
                 return None, None
             if 1 <= choice <= len(available_batches):
                 selected_batch = available_batches[choice-1]
-                # 根据轮次名称自动判断课程类型
-                course_type = COURSE_TYPE_TYKC if "体育" in selected_batch['name'] else COURSE_TYPE_FANKC
+                course_type = resolve_course_type(
+                    session, token, selected_batch['code'], selected_batch.get('name', '')
+                )
+                if not course_type:
+                    # 用户在类型选择里选了返回，重新选轮次
+                    print("\n返回轮次选择...")
+                    continue
                 return selected_batch, course_type
             else:
                 print("无效的输入，请输入列表中的数字。")
@@ -1097,7 +1102,7 @@ def main():
 
     # 6. 选择轮次和课程（支持返回上一级）
     while True:
-        batch, course_type = choose_elective_batch(login_data)
+        batch, course_type = choose_elective_batch(login_data, session, token)
         if not batch:
             return
         batch_id = batch['code']
