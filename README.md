@@ -24,7 +24,7 @@ pip install -r requirements.txt
 | 通识课退改选蹲空位自动抢（不要求先退课） | **`xgkc_monitor.py`** |
 | 通识选修哪门竞争小一点 | **`xgkc_query.py`** |
 
-剩下的 `course_backup_v1/v2`、`course_desperated` 都是演进过程里留下来的，能跑但别当主力。`xgkc_common.py` 是通识课共享筛选模块（网课识别/时间解析/筛选器），`probe_xgkc.py` 是接口结构探针（本机运行，用于确认字段格式）。
+剩下的 `course_backup_v1/v2`、`course_desperated` 都是演进过程里留下来的，能跑但别当主力。`xgkc_common.py` 是通识课共享筛选模块（网课识别/时间解析/筛选器）。
 
 ---
 
@@ -128,7 +128,6 @@ v1 单课硬抢
 - 抢课别太猛，403 基本就是被限频了，脚本里已经会吞掉这类噪音。
 - `xgkc_monitor.py` 与其它脚本一样把日志写入 `logs/{学号}/`；监控期间终端**一行状态实时覆盖刷新**（不保留旧状态行），空位/选课/退课/回补/重登等关键事件另起一行打印，状态变化与事件细节全部在日志文件里。
 - cookie 文件格式就是浏览器里复制那种：`key=value; key2=value2; ...`
-- 想确认通识课接口字段结构（脱敏探针）：`python probe_xgkc.py -u 学号 -p 密码`，报告在 `probe_output/`
 - 备份脚本和压缩包可以无视，不影响正常使用。
 - `ck.txt`、`vpn_cookie.txt`、日志这些已经写进 `.gitignore` 了，别手贱 push 上去。
 
