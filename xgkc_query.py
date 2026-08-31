@@ -502,7 +502,7 @@ def display_results(courses, page_info=None):
         
         if is_selected and (zydj == "1" or zydj == 1):
             first_vol -= 1  # 已选课程从一志愿中减去
-
+        
         # 根据竞争比设置颜色
         if ratio < 0.75:
             ratio_style = "green"

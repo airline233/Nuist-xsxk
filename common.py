@@ -685,10 +685,12 @@ class WebSocketHeartbeat:
     避免旧实现「每次重连叠加一个心跳线程 + 调用栈越叠越深」的泄漏。
     """
 
-    def __init__(self, student_id, cookies=None, use_vpn=False, on_course_success=None, on_course_fail=None):
+    def __init__(self, student_id, cookies=None, use_vpn=False, on_course_success=None, on_course_fail=None,
+                 log_only=False):
         self.student_id = student_id
         self.cookies = cookies
         self.use_vpn = use_vpn
+        self.log_only = log_only  # True 时只写日志文件，不打印到终端
         self.ws = None
         self.running = False
         self.thread = None
@@ -715,6 +717,11 @@ class WebSocketHeartbeat:
 
     def _on_open(self, ws):
         heartbeat_logger.info(f"[WebSocket] 连接已建立: {self.student_id}")
+
+    def _echo(self, message):
+        """终端提示（log_only 时不打印；详细内容始终由 logger 写文件）。"""
+        if not self.log_only:
+            print(message)
 
     def _on_message(self, ws, message):
         try:
@@ -754,7 +761,7 @@ class WebSocketHeartbeat:
                     course_name = msg.split(":", 1)[1] if ":" in str(msg) else str(msg)
 
                 clazz_id = str(clazz_id) if clazz_id else ""
-                print(f"\n[WebSocket] 🎉 选课成功: {course_name}")
+                self._echo(f"\n[WebSocket] 🎉 选课成功: {course_name}")
                 main_logger.info(f"[WebSocket] 选课成功: {course_name}, clazzId={clazz_id or '(空)'}")
                 heartbeat_logger.info(f"[WebSocket] 选课成功响应: {data}")
 
@@ -777,7 +784,7 @@ class WebSocketHeartbeat:
 
             # 检查是否为选课失败消息（课容量已满等）
             elif code == 500 and _is_full_msg(msg):
-                print(f"\n[WebSocket] ⚠️ 选课失败: {msg}")
+                self._echo(f"\n[WebSocket] ⚠️ 选课失败: {msg}")
                 main_logger.warning(f"[WebSocket] 选课失败 - 课容量已满: {msg}")
                 heartbeat_logger.warning(f"[WebSocket] 选课失败响应: {data}")
 
@@ -789,7 +796,7 @@ class WebSocketHeartbeat:
                         heartbeat_logger.error(f"[WebSocket] 选课失败回调异常: {e}")
 
             elif code is not None and code != 200:
-                print(f"\n[WebSocket 警告] code={code}, msg={msg}")
+                self._echo(f"\n[WebSocket 警告] code={code}, msg={msg}")
                 heartbeat_logger.warning(f"[WebSocket] 非200响应: code={code}, msg={msg}")
                 # 其它失败也通知上层，避免主循环死等
                 if self.on_course_fail and code == 500:
