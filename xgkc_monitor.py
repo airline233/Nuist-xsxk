@@ -3,7 +3,7 @@
 结构与 course_cron.py 保持一致（函数一一对应），差异点：
 - 通识课列表是扁平行结构（每行一个教学班，JXBID/secretVal 直接在行上），
   所以 get_course_capacity / fetch_selected_classes 改为扁平行版本；
-- 默认「纯监控抢选」：不要求先退课（drop_class_info=None 时不进退课流程）；
+- 默认「监控抢选」：不要求先退课（drop_class_info=None 时不进退课流程）；
   --swap 打开退旧换新模式，状态机与 course_cron 完全一致（退→抢→失败回补）；
 - 支持筛选（网课/类别/教师/星期/节次/冲突等），筛选逻辑在 xgkc_common.py。
 
@@ -11,7 +11,7 @@
 满员靠 WS 回调确认。基建（登录/重登/双心跳/OCR）复用 common.py。
 
 用法：
-    python xgkc_monitor.py -u 学号 -p 密码                 # 纯监控抢选（选择界面按 f 筛选）
+    python xgkc_monitor.py -u 学号 -p 密码                 # 监控抢选（未开始会等到点自动开始）
     python xgkc_monitor.py -u 学号 -p 密码 --one-per-category  # 每个大类只抢一门，抢到即停该类
     python xgkc_monitor.py -u 学号 -p 密码 --swap         # 退旧换新模式
     python xgkc_monitor.py -u 学号 -p 密码 --batch <code> # 指定轮次
@@ -75,7 +75,7 @@ COURSE_TYPE_XGKC = "XGKC"
 PAGE_SIZE = 500           # 一次拉取的教学班上限
 POLL_INTERVAL = 3         # 容量轮询间隔（秒）：多目标监控建议 3~5s，太快易触发 403 限频
 GRAB_INTERVAL = 0.3       # 抢课重投间隔（秒），与 course.py 抢课循环一致
-MAX_GRAB_RETRIES = 15     # 检测到空位后的连抢上限（约 4.5s），超过回到容量轮询
+MAX_GRAB_RETRIES = 5      # 检测到空位后的连抢上限（约 1.5s），超过回到容量轮询
 
 
 # ---------------------------------------------------------------- 列表获取（扁平行）
@@ -734,7 +734,7 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
 
     差异：
     - target_classes 为列表（无优先级，全部目标同时监控）：每轮检查所有目标，谁有空位抢谁；
-    - drop_class_info 为 None 时为「纯监控抢选」（不要求先退课），
+    - drop_class_info 为 None 时为「监控抢选」（不要求先退课），
       检测到空位直接抢，不进 dropped_pending_add 状态；
     - 容量轮询每 POLL_INTERVAL 秒一次（多个目标共用一次全量列表请求，不增加请求量）；
       抢课投递与 course.py 一致：检测到空位后按 0.3 秒间隔连续重投，
@@ -888,7 +888,6 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
     pending_fail_streak = 0
     last_restore_ok_at = 0.0
     missing_warned = set()
-    last_status_key = None  # 终端状态行去重：仅在容量/状态变化时打印
 
     print("\n" + "=" * 60)
     print("监控目标课程:")
@@ -896,15 +895,13 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
         print(f"  [{i}] {get_display_name(t)} - {t['SKJS']} [{t.get('YXRS', '?')}/{t.get('KRL', '?')}]")
     if swap_mode:
         print(f"准备退掉课程: {drop_name} - {drop_class_info['SKJS']}")
-        print(f"每 {POLL_INTERVAL} 秒检测一次课容量；空位时退课→选课。")
         print(
             f"状态保护：退课后持续抢目标；连续 {RESTORE_AFTER_FAILS} 次未中则尝试回补旧课，"
             f"回补成功后 {RESTORE_COOLDOWN_SEC:.0f}s 内不再退。"
         )
         print("Ctrl+C 中断时会立即尝试回补旧课。")
     else:
-        print("模式：纯监控抢选（不退课），检测到空位立即抢。")
-        print(f"每 {POLL_INTERVAL} 秒检测一次课容量。")
+        print("模式：监控抢选，检测到空位立即抢。")
         if one_per_category:
             print("每个通识大类抢到一门后，该大类停止监控，其它大类继续。")
     print("=" * 60 + "\n")
@@ -979,7 +976,6 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
             # 刷新所有目标的最新快照/容量，并找出有空位的目标（无优先级）
             slot_targets = []   # [(target_snapshot, latest_row)]
             status_parts = []
-            status_key = []     # 用于终端去重：[(JXBID, yxrs, krl), ...]
             conflict_removed = []
             for t in list(targets):
                 latest = _find_row(rows, t["JXBID"])
@@ -988,7 +984,6 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
                         missing_warned.add(t["JXBID"])
                         main_logger.warning(f"目标课不在列表中: JXBID={t.get('JXBID')} {t.get('KCM')}")
                     status_parts.append(f"{short_name(t)}:?/?")
-                    status_key.append((str(t["JXBID"]), None, None))
                     continue
                 t.update(latest)  # 快照刷新（secretVal 等）
                 # 纯监控模式：与已选课时间冲突（且未选上）的目标直接移出监控列表
@@ -1002,10 +997,8 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
                 yxrs = int(latest.get("YXRS", 0) or 0)
                 krl = int(latest.get("KRL", 0) or 0)
                 status_parts.append(f"{short_name(t)}:{yxrs}/{krl}")
-                status_key.append((str(t["JXBID"]), yxrs, krl))
                 if yxrs < krl:
                     slot_targets.append((t, latest))
-            status_key = tuple(status_key)
 
             if conflict_removed:
                 for t in conflict_removed:
@@ -1131,7 +1124,7 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
                             f"第 {grab_attempts} 次，{GRAB_INTERVAL:.1f}s 后重试"
                         )
                         if grab_attempts == 1:
-                            announce(f"[{dt}] 抢课未成功({reason})，按 {GRAB_INTERVAL:.1f}s 间隔重试")
+                            announce(f"[{dt}] 抢课未成功({reason})")
                         else:
                             show_status(f"[{dt}] 抢课未成功({reason}) 第 {grab_attempts} 次")
                         if grab_attempts >= MAX_GRAB_RETRIES:
@@ -1161,12 +1154,10 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
                     break
                 continue
 
-            # 已满：终端单行覆盖刷新（按显示宽度截断，不保留旧状态行）；日志文件仅在状态变化时记录
+            # 已满：终端单行覆盖刷新；每轮状态都写入日志文件（保证日志持续更新）
             status_line = f"[{dt}] [{check_count}] " + " | ".join(status_parts) + f" (已满) [{state}]"
             show_status(status_line)
-            if status_key != last_status_key:
-                last_status_key = status_key
-                main_logger.info(f"容量监控: {status_line}")
+            main_logger.info(f"容量监控: {status_line}")
             time.sleep(POLL_INTERVAL)
 
     except KeyboardInterrupt:
@@ -1186,17 +1177,17 @@ def start_monitoring(session, token, batch_id, campus, target_classes, drop_clas
 # ---------------------------------------------------------------- 主流程（对应 course_cron.run_course_selection / main）
 
 def run_course_selection(session, token, batch_id, campus, username, use_vpn,
-                         course_type=COURSE_TYPE_XGKC, swap=False, one_per_category=False):
+                         course_type=COURSE_TYPE_XGKC, swap=False, one_per_category=False,
+                         begin_time=""):
     """运行监控抢课流程
 
     流程：
-    1. 选择目标课程（支持多选，全部目标同时监控，无优先级）
-    2. --swap 时：从已选课程中选择要退的课（没有已选课则退化为纯抢选）
-    3. 确认后开始监控
-    4. 检测到空位：抢课（换课模式先退课）；
+    0. 先设置筛选（仅网课/排除冲突/通识类别/教师/星期），再选目标课程
+       （支持多选，全部目标同时监控，无优先级）
+    1. --swap 时：从已选课程中选择要退的课（没有已选课则退化为纯抢选）
+    2. 确认后：选课未开始则挂机等到 beginTime 自动开始监控（心跳保持登录态）
+    3. 检测到空位：抢课（换课模式先退课）；
        --one-per-category 时，抢到一门后该大类停止、其它大类继续
-
-    筛选（仅网课/类别大类/教师/星期/节次/教学方式等）在第一步的选择界面按 f 设置。
     """
     student_id = username
     if not student_id:
@@ -1235,9 +1226,10 @@ def run_course_selection(session, token, batch_id, campus, username, use_vpn,
         return f"🌐 {name}" if is_online_course(clazz) else name
 
     try:
-        # 1. 选择目标课程（可多选，全部目标同时监控）
-        print("\n--- 第一步：选择要抢的目标课程 ---")
+        # 1. 先设置筛选，再展示列表选择目标课程（避免一次全量课程刷屏）
+        print("\n--- 第一步：设置筛选并选择目标课程 ---")
         filters = build_filters()
+        filter_menu(filters)
         result = choose_class(session, token, batch_id, campus, course_type, filters=filters)
         if result is None or result[0] is None:
             return
@@ -1280,7 +1272,7 @@ def run_course_selection(session, token, batch_id, campus, username, use_vpn,
             ]
 
             if not selected_only:
-                print("\n[!] 未找到可退的已选课程（SFYX=1），退化为纯监控抢选模式。")
+                print("\n[!] 未找到可退的已选课程（SFYX=1），退化为监控抢选模式。")
             else:
                 for i, clazz in enumerate(selected_only, 1):
                     print(
@@ -1314,7 +1306,7 @@ def run_course_selection(session, token, batch_id, campus, username, use_vpn,
             print(f"  要退课程: {get_display_name(drop_class_info)} - {drop_class_info['SKJS']}")
             print("  注意：退课后会持续抢目标；多次未中会尝试回补旧课，Ctrl+C 也会回补。")
         else:
-            print("  模式：纯监控抢选（不退课）")
+            print("  模式：监控抢选")
         print("=" * 50)
 
         confirm = input("\n确认开始监控？(y/n): ").strip().lower()
@@ -1322,7 +1314,34 @@ def run_course_selection(session, token, batch_id, campus, username, use_vpn,
             print("操作已取消。")
             return
 
-        # 4. 开始监控
+        # 4. 选课未开始：挂机等待，提前 30 秒开始监控（心跳已启动，登录态保持）
+        if begin_time:
+            try:
+                begin_epoch = datetime.datetime.strptime(
+                    begin_time, "%Y-%m-%d %H:%M:%S"
+                ).timestamp()  # 本地时间
+            except ValueError:
+                begin_epoch = None
+            if begin_epoch:
+                EARLY_START_SEC = 30  # 提前 30 秒开始监控，避免开抢瞬间还在启动
+                while True:
+                    now = time.time()
+                    if now >= begin_epoch - EARLY_START_SEC:
+                        print("\n[✓] 选课即将开始，提前 30 秒开始监控...")
+                        main_logger.info("选课即将开始，提前30秒开始监控")
+                        break
+                    total = int(begin_epoch - EARLY_START_SEC - now)
+                    days, rem = divmod(total, 86400)
+                    hours, rem = divmod(rem, 3600)
+                    minutes, seconds = divmod(rem, 60)
+                    print(
+                        f"\r选课尚未开始，已就绪等待中，距监控开始: "
+                        f"{days}天{hours:02d}小时{minutes:02d}分{seconds:02d}秒",
+                        end="", flush=True,
+                    )
+                    time.sleep(1)
+
+        # 5. 开始监控
         start_monitoring(
             session, token, batch_id, campus, target_classes, drop_class_info,
             course_type=course_type, ws_heartbeat=ws_heartbeat,
@@ -1442,6 +1461,25 @@ def main():
     login_state.batch_id = batch_id
     print(f"[✓] 已选择轮次: {picked.get('name')} (code={batch_id})")
 
+    # 选课起止时间：登录返回的 electiveBatchList 自带，无需额外请求
+    begin_str = str(picked.get("beginTime") or "")
+    end_str = str(picked.get("endTime") or "")
+    if begin_str or end_str:
+        print(f"    选课时间: {begin_str or '?'} ~ {end_str or '?'}")
+    if begin_str:
+        try:
+            begin_dt = datetime.datetime.strptime(begin_str, "%Y-%m-%d %H:%M:%S")
+            now = datetime.datetime.now()
+            if begin_dt > now:
+                remain = begin_dt - now
+                hours, rem = divmod(remain.seconds, 3600)
+                minutes, seconds = divmod(rem, 60)
+                print(f"    距开始还有: {remain.days}天{hours}小时{minutes}分{seconds}秒（将提前30秒开始监控）")
+            else:
+                print("    选课已开始（进行中）")
+        except ValueError:
+            pass
+
     # 课程类型：以服务端 menuList 为准，兜底 XGKC
     course_type = resolve_course_type(session, token, batch_id, picked.get("name", ""))
     if not course_type:
@@ -1461,6 +1499,7 @@ def main():
         course_type=course_type,
         swap=args.swap,
         one_per_category=args.one_per_category,
+        begin_time=begin_str,
     )
 
     input("回车键退出")
