@@ -136,9 +136,12 @@ def fetch_xgkc_rows(session, token, batch_id, campus, page_size=PAGE_SIZE):
             data2 = resp2.json()
         except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
             main_logger.warning(f"通识课全量拉取异常: {e}")
-            return "ok", rows
+            return "fail", []
         if data2.get("code") != 200:
-            return "ok", rows
+            main_logger.warning(
+                f"通识课全量拉取失败: code={data2.get('code')}, msg={data2.get('msg', '')}"
+            )
+            return "fail", []
         return "ok", data2.get("data", {}).get("rows") or rows
 
     status, rows = _do_fetch(token)
