@@ -49,7 +49,7 @@ COURSE_TYPE_NAMES = {
 
 # API 端点
 BASE_URL = "https://client.vpn.nuist.edu.cn/https/webvpn3315a96df5a2811a49489fcebfe8b135dece10c6255d04cc36c652f60ee89b3a/xsxk"
-# BASE_URL = "http://xsxk.nuist.edu.cn/xsxk"
+# BASE_URL = "https://xsxk.nuist.edu.cn/xsxk"
 URL_CAPTCHA = f"{BASE_URL}/auth/captcha?enlink-vpn"
 URL_LOGIN = f"{BASE_URL}/auth/login?enlink-vpn"
 URL_LIST_CLASSES = f"{BASE_URL}/elective/clazz/list?enlink-vpn"
